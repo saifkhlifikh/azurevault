@@ -1,20 +1,3 @@
-# SSH into your VM
-ssh -i ~/.ssh/id_rsa vm@40.89.132.89
-
-# Stop the current Flask app (Ctrl+C if running)
-
-# Go to your app directory
-cd ~/AzureVault
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Backup the old app
-cp app.py app.py.backup
-
-# Create the new modern app
-cat > app.py << 'EOF'
-# -*- coding: utf-8 -*-
 from flask import Flask, render_template_string, request, jsonify
 import os
 from azure.storage.blob import BlobServiceClient
@@ -482,7 +465,3 @@ def delete_file():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-EOF
-
-# Restart Flask
-python3 app.py
