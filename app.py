@@ -1171,13 +1171,18 @@ function formatBytes(bytes) {
 function refreshFiles() {
     fetch('/files')
         .then(r => r.json())
-        .then(files => {
-            allFiles = files;
+        .then(raw => {
+            // Normalize: handle both string[] and object[] from the API
+            allFiles = raw.map(f =>
+                typeof f === 'string'
+                    ? { name: f, size: 0, last_modified: null, content_type: null }
+                    : f
+            );
             renderFiles();
             updateSidebarStats();
             updateDashStats();
         })
-        .catch(() => showToast('Failed to load files', 'error'));
+        .catch(e => { console.error('refreshFiles error:', e); showToast('Failed to load files', 'error'); });
 }
 
 function updateSidebarStats() {
@@ -1531,18 +1536,26 @@ def list_files():
         container = get_container()
         if not container:
             return jsonify([])
-        blobs = container.list_blobs(include=['properties'])
         result = []
-        for blob in blobs:
+        for blob in container.list_blobs():
+            try:
+                size = blob.size or 0
+            except Exception:
+                size = 0
+            try:
+                last_modified = blob.last_modified.isoformat() if blob.last_modified else None
+            except Exception:
+                last_modified = None
             result.append({
                 'name': blob.name,
-                'size': blob.size,
-                'last_modified': blob.last_modified.isoformat() if blob.last_modified else None,
-                'content_type': blob.content_settings.content_type if blob.content_settings else None,
+                'size': size,
+                'last_modified': last_modified,
+                'content_type': None,
             })
         result.sort(key=lambda x: x.get('last_modified') or '', reverse=True)
         return jsonify(result)
     except Exception as e:
+        print(f"ERROR /files: {e}")
         return jsonify([]), 500
 
 @app.route('/upload', methods=['POST'])
