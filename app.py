@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 from flask import Flask, render_template_string, request, jsonify, send_file
 import os
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
-import json
-import re
+import mimetypes
 
 load_dotenv()
 
@@ -16,29 +15,32 @@ STORAGE_ACCOUNT_NAME = os.getenv('STORAGE_ACCOUNT_NAME')
 CONTAINER_NAME = os.getenv('CONTAINER_NAME')
 STORAGE_CONNECTION_STRING = os.getenv('STORAGE_CONNECTION_STRING')
 
+# Extract account key from connection string
+ACCOUNT_KEY = None
+if STORAGE_CONNECTION_STRING:
+    import re
+    match = re.search(r'AccountKey=([^;]+)', STORAGE_CONNECTION_STRING)
+    if match:
+        ACCOUNT_KEY = match.group(1)
+
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AzureVault Notes - Markdown Note Manager</title>
+    <title>AzureVault Pro - File Manager</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/highlight.js@11.8.0/styles/atom-one-dark.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/marked@11.0.0/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.8.0/highlight.min.js"></script>
     <style>
         :root {
             --primary: #0078d4;
             --secondary: #005a9e;
             --success: #28a745;
             --danger: #dc3545;
+            --warning: #ffc107;
             --light: #f5f5f5;
             --dark: #1f1f1f;
-            --sidebar-bg: #f8f9fa;
-            --border: #e0e0e0;
         }
         
         * {
@@ -48,760 +50,829 @@ HTML_TEMPLATE = '''
         }
         
         body {
-            background: #fafafa;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            flex-direction: column;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
         
         .navbar {
-            background: white;
-            border-bottom: 1px solid var(--border);
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            background: rgba(255, 255, 255, 0.98) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
             padding: 12px 20px;
         }
         
         .navbar-brand {
             font-weight: 700;
-            font-size: 1.3rem;
+            font-size: 1.4rem;
             color: var(--primary) !important;
-            margin: 0;
         }
         
         .navbar-brand i {
             margin-right: 8px;
         }
         
-        .main-container {
-            display: flex;
-            flex: 1;
-            overflow: hidden;
+        .container-main {
+            margin-top: 30px;
+            margin-bottom: 40px;
         }
         
-        .sidebar {
-            width: 300px;
-            background: var(--sidebar-bg);
-            border-right: 1px solid var(--border);
-            overflow-y: auto;
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .sidebar-header {
-            margin-bottom: 20px;
-        }
-        
-        .search-box {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 0.9rem;
-            margin-bottom: 15px;
-        }
-        
-        .sidebar-section {
+        .card {
+            border: none;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+            transition: all 0.3s;
             margin-bottom: 25px;
         }
         
-        .sidebar-section-title {
-            font-size: 0.75rem;
+        .card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+        }
+        
+        .card-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            color: white;
+            border: none;
+            border-radius: 12px 12px 0 0;
+            padding: 20px;
+        }
+        
+        .card-header h5 {
+            margin: 0;
             font-weight: 600;
-            color: #666;
-            text-transform: uppercase;
-            margin-bottom: 10px;
-            letter-spacing: 0.5px;
+            font-size: 1.1rem;
         }
         
-        .note-item {
-            padding: 12px;
-            margin-bottom: 8px;
-            background: white;
-            border-radius: 6px;
-            border-left: 3px solid var(--primary);
-            cursor: pointer;
-            transition: all 0.3s;
-            border: 1px solid #e0e0e0;
-            font-size: 0.9rem;
-        }
-        
-        .note-item:hover {
-            background: #f0f0f0;
-            transform: translateX(5px);
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-        }
-        
-        .note-item.active {
-            background: var(--primary);
+        .status-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            border-left-color: var(--secondary);
-        }
-        
-        .note-item-title {
-            font-weight: 500;
-            margin-bottom: 4px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        
-        .note-item-date {
-            font-size: 0.75rem;
-            opacity: 0.7;
-        }
-        
-        .tag {
-            display: inline-block;
-            background: #e3f2fd;
-            color: var(--primary);
-            padding: 3px 8px;
             border-radius: 12px;
-            font-size: 0.75rem;
-            margin: 2px;
-            cursor: pointer;
+            padding: 25px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        
+        .status-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .status-icon {
+            font-size: 1.3rem;
+            margin-right: 12px;
+        }
+        
+        .status-text {
+            font-size: 0.95rem;
+        }
+        
+        /* Statistics Dashboard */
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+            text-align: center;
             transition: all 0.3s;
         }
         
-        .tag:hover {
-            background: var(--primary);
-            color: white;
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
         }
         
-        .tag.active {
-            background: var(--primary);
-            color: white;
+        .stat-number {
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 8px;
         }
         
-        .editor-container {
-            flex: 1;
+        .stat-label {
+            font-size: 0.9rem;
+            color: #666;
+            font-weight: 500;
+        }
+        
+        /* Upload Area */
+        .upload-area {
+            border: 2px dashed var(--primary);
+            border-radius: 12px;
+            padding: 45px 20px;
+            text-align: center;
+            background: linear-gradient(to bottom, rgba(102, 126, 234, 0.05), rgba(118, 75, 162, 0.05));
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover, .upload-area.dragover {
+            border-color: var(--secondary);
+            background: linear-gradient(to bottom, rgba(102, 126, 234, 0.15), rgba(118, 75, 162, 0.15));
+            transform: scale(1.02);
+        }
+        
+        .upload-icon {
+            font-size: 3.5rem;
+            color: var(--primary);
+            margin-bottom: 15px;
+        }
+        
+        .upload-icon-success {
+            color: var(--success);
+        }
+        
+        /* Upload Progress */
+        .upload-progress-container {
+            margin-top: 20px;
+        }
+        
+        .progress {
+            height: 8px;
+            border-radius: 10px;
+            background: #e9ecef;
+        }
+        
+        .progress-bar {
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+        }
+        
+        /* Search & Filter */
+        .search-filter-container {
             display: flex;
-            flex-direction: column;
-            overflow: hidden;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
         }
         
-        .editor-header {
+        .search-box {
+            flex: 1;
+            min-width: 250px;
+            padding: 12px 16px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            transition: all 0.3s;
+        }
+        
+        .search-box:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(0, 120, 212, 0.1);
+        }
+        
+        .filter-btn {
+            padding: 10px 16px;
             background: white;
-            padding: 15px 20px;
-            border-bottom: 1px solid var(--border);
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        
+        .filter-btn:hover, .filter-btn.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+        
+        /* File Items */
+        .file-item {
+            padding: 16px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 12px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }
-        
-        .editor-title-input {
-            font-size: 1.5rem;
-            font-weight: 600;
-            border: none;
-            outline: none;
-            background: transparent;
-            flex: 1;
-            margin-right: 20px;
-        }
-        
-        .editor-buttons {
-            display: flex;
-            gap: 10px;
-        }
-        
-        .btn-sm {
-            padding: 6px 12px;
-            font-size: 0.85rem;
-            border-radius: 6px;
-            border: none;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .btn-primary-sm {
-            background: var(--primary);
-            color: white;
-        }
-        
-        .btn-primary-sm:hover {
-            background: var(--secondary);
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0, 120, 212, 0.3);
-        }
-        
-        .btn-secondary-sm {
-            background: #6c757d;
-            color: white;
-        }
-        
-        .btn-danger-sm {
-            background: var(--danger);
-            color: white;
-        }
-        
-        .editor-content {
-            display: flex;
-            flex: 1;
-            overflow: hidden;
-            gap: 0;
-        }
-        
-        .editor-pane {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            border-right: 1px solid var(--border);
-        }
-        
-        .markdown-editor {
-            flex: 1;
-            padding: 20px;
-            font-family: 'Fira Code', 'Courier New', monospace;
-            font-size: 0.95rem;
-            border: none;
-            outline: none;
-            background: white;
-            resize: none;
-            line-height: 1.6;
-        }
-        
-        .preview-pane {
-            flex: 1;
-            overflow-y: auto;
-            padding: 20px;
-            background: white;
-        }
-        
-        .markdown-preview {
-            font-size: 1rem;
-            line-height: 1.8;
-            color: #333;
-        }
-        
-        .markdown-preview h1 {
-            font-size: 2rem;
-            margin: 24px 0 16px 0;
-            font-weight: 700;
-            border-bottom: 2px solid var(--primary);
-            padding-bottom: 8px;
-        }
-        
-        .markdown-preview h2 {
-            font-size: 1.5rem;
-            margin: 20px 0 12px 0;
-            font-weight: 600;
-            color: var(--primary);
-        }
-        
-        .markdown-preview h3 {
-            font-size: 1.2rem;
-            margin: 16px 0 8px 0;
-            font-weight: 600;
-        }
-        
-        .markdown-preview p {
-            margin: 12px 0;
-        }
-        
-        .markdown-preview ul, .markdown-preview ol {
-            margin: 12px 0 12px 20px;
-        }
-        
-        .markdown-preview li {
-            margin: 6px 0;
-        }
-        
-        .markdown-preview code {
-            background: #f4f4f4;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-family: 'Fira Code', monospace;
-            font-size: 0.9rem;
-        }
-        
-        .markdown-preview pre {
-            background: #1e1e1e;
-            color: #d4d4d4;
-            padding: 15px;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin: 12px 0;
-        }
-        
-        .markdown-preview pre code {
-            background: none;
-            padding: 0;
-            color: inherit;
-        }
-        
-        .markdown-preview blockquote {
             border-left: 4px solid var(--primary);
-            padding-left: 16px;
-            margin: 12px 0;
-            color: #666;
-            font-style: italic;
-        }
-        
-        .markdown-preview table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 12px 0;
-        }
-        
-        .markdown-preview th, .markdown-preview td {
-            border: 1px solid #ddd;
-            padding: 10px;
-            text-align: left;
-        }
-        
-        .markdown-preview th {
-            background: #f4f4f4;
-            font-weight: 600;
-        }
-        
-        .markdown-preview a {
-            color: var(--primary);
-            text-decoration: none;
-        }
-        
-        .markdown-preview a:hover {
-            text-decoration: underline;
-        }
-        
-        .empty-state {
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            height: 100%;
-            color: #999;
-            text-align: center;
-        }
-        
-        .empty-state i {
-            font-size: 4rem;
-            margin-bottom: 20px;
-            opacity: 0.5;
-        }
-        
-        .tab-bar {
-            display: flex;
-            gap: 10px;
-            padding: 15px 20px;
-            border-bottom: 1px solid var(--border);
-            background: #f9f9f9;
-        }
-        
-        .tab {
-            padding: 8px 16px;
-            background: white;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            cursor: pointer;
             transition: all 0.3s;
-            font-size: 0.9rem;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
         }
         
-        .tab:hover {
-            background: var(--primary);
-            color: white;
-            border-color: var(--primary);
+        .file-item:hover {
+            background: #f9f9f9;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
+            transform: translateX(4px);
         }
         
-        .tab.active {
-            background: var(--primary);
-            color: white;
-            border-color: var(--primary);
+        .file-info {
+            flex: 1;
+            min-width: 0;
         }
         
-        .stats-bar {
+        .file-name {
+            font-weight: 600;
+            color: var(--dark);
+            margin-bottom: 6px;
+            word-break: break-word;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .file-icon {
+            font-size: 1.3rem;
+            color: var(--primary);
+        }
+        
+        .file-meta {
+            font-size: 0.85rem;
+            color: #999;
             display: flex;
             gap: 15px;
-            padding: 10px 20px;
-            background: #f9f9f9;
-            border-top: 1px solid var(--border);
-            font-size: 0.85rem;
-            color: #666;
         }
         
-        .stat-item {
+        .file-actions {
+            display: flex;
+            gap: 8px;
+            margin-left: 15px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+        
+        .btn-action {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.85rem;
+            font-weight: 500;
             display: flex;
             align-items: center;
             gap: 6px;
         }
         
+        .btn-download {
+            background: var(--primary);
+            color: white;
+        }
+        
+        .btn-download:hover {
+            background: var(--secondary);
+            transform: translateY(-2px);
+        }
+        
+        .btn-share {
+            background: var(--success);
+            color: white;
+        }
+        
+        .btn-share:hover {
+            background: #20c997;
+            transform: translateY(-2px);
+        }
+        
+        .btn-preview {
+            background: var(--warning);
+            color: white;
+        }
+        
+        .btn-preview:hover {
+            background: #e0a800;
+            transform: translateY(-2px);
+        }
+        
+        .btn-delete {
+            background: var(--danger);
+            color: white;
+        }
+        
+        .btn-delete:hover {
+            background: #c82333;
+            transform: translateY(-2px);
+        }
+        
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+        
+        .empty-state i {
+            font-size: 4rem;
+            color: #ddd;
+            margin-bottom: 20px;
+        }
+        
+        .empty-state h4 {
+            color: #666;
+            margin-bottom: 10px;
+        }
+        
+        /* Modal */
+        .modal-content {
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+        }
+        
+        .modal-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            color: white;
+            border: none;
+        }
+        
+        /* Footer */
+        .footer {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 25px;
+            margin-top: 40px;
+            border-top: 1px solid #eee;
+            text-align: center;
+        }
+        
+        /* Toast */
         .toast-container {
             position: fixed;
             top: 20px;
             right: 20px;
-            z-index: 1000;
+            z-index: 1050;
         }
         
-        @media (max-width: 1024px) {
-            .editor-content {
+        .toast {
+            background: white;
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin-bottom: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                transform: translateX(400px);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .stats-container {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .search-filter-container {
                 flex-direction: column;
             }
             
-            .editor-pane {
-                border-right: none;
-                border-bottom: 1px solid var(--border);
+            .search-box {
+                min-width: 100%;
             }
-        }
-        
-        @media (max-width: 768px) {
-            .sidebar {
-                width: 250px;
+            
+            .file-item {
+                flex-direction: column;
+                align-items: flex-start;
             }
-        }
-        
-        .create-note-btn {
-            width: 100%;
-            padding: 12px;
-            background: var(--primary);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: 500;
-            cursor: pointer;
-            margin-bottom: 15px;
-            transition: all 0.3s;
-        }
-        
-        .create-note-btn:hover {
-            background: var(--secondary);
-            transform: translateY(-2px);
+            
+            .file-actions {
+                margin-left: 0;
+                margin-top: 12px;
+                width: 100%;
+            }
+            
+            .btn-action {
+                flex: 1;
+                justify-content: center;
+            }
         }
     </style>
 </head>
 <body>
     <!-- Navigation -->
-    <nav class="navbar">
-        <span class="navbar-brand">
-            <i class="bi bi-book"></i>AzureVault Notes
-        </span>
+    <nav class="navbar navbar-light sticky-top">
+        <div class="container-fluid">
+            <span class="navbar-brand">
+                <i class="bi bi-lock-fill"></i>AzureVault Pro
+            </span>
+            <div class="text-muted small">
+                <i class="bi bi-cloud"></i> Advanced Secure File Manager
+            </div>
+        </div>
     </nav>
 
-    <!-- Main Layout -->
-    <div class="main-container">
-        <!-- Sidebar -->
-        <div class="sidebar">
-            <button class="create-note-btn" onclick="createNewNote()">
-                <i class="bi bi-plus-lg"></i> New Note
-            </button>
-            
-            <input type="text" class="search-box" id="searchInput" placeholder="Search notes..." onkeyup="filterNotes()">
-            
-            <div class="sidebar-section">
-                <div class="sidebar-section-title">Tags</div>
-                <div id="tagsContainer"></div>
+    <!-- Main Container -->
+    <div class="container-fluid container-main" style="max-width: 1200px;">
+        <!-- Status Box -->
+        <div class="status-box">
+            <div class="status-item">
+                <span class="status-icon"><i class="bi bi-check-circle"></i></span>
+                <span class="status-text"><strong>Status:</strong> AzureVault Pro running</span>
             </div>
-            
-            <div class="sidebar-section" style="flex: 1; overflow-y: auto;">
-                <div class="sidebar-section-title">Recent Notes</div>
-                <div id="notesList"></div>
+            <div class="status-item">
+                <span class="status-icon"><i class="bi bi-shield-check"></i></span>
+                <span class="status-text"><strong>Security:</strong> End-to-end encrypted & private</span>
+            </div>
+            <div class="status-item">
+                <span class="status-icon"><i class="bi bi-cloud-check"></i></span>
+                <span class="status-text"><strong>Storage:</strong> Azure Blob Storage connected</span>
             </div>
         </div>
 
-        <!-- Editor -->
-        <div class="editor-container">
-            <!-- Empty State -->
-            <div id="emptyState" class="empty-state" style="display: flex;">
-                <i class="bi bi-file-text"></i>
-                <h3>Welcome to AzureVault Notes</h3>
-                <p>Create a new note or select one from the sidebar</p>
+        <!-- Statistics Dashboard -->
+        <div class="stats-container">
+            <div class="stat-card">
+                <div class="stat-number" id="totalFiles">0</div>
+                <div class="stat-label">Total Files</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-number" id="totalSize">0 MB</div>
+                <div class="stat-label">Total Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="imageCount">0</div>
+                <div class="stat-label">Images</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="docCount">0</div>
+                <div class="stat-label">Documents</div>
+            </div>
+        </div>
 
-            <!-- Editor Content -->
-            <div id="editorContent" style="display: none; flex: 1; overflow: hidden;">
-                <!-- Editor Header -->
-                <div class="editor-header">
-                    <input type="text" class="editor-title-input" id="noteTitle" placeholder="Note Title">
-                    <div class="editor-buttons">
-                        <button class="btn-sm btn-primary-sm" onclick="saveNote()">
-                            <i class="bi bi-check-lg"></i> Save
-                        </button>
-                        <button class="btn-sm btn-secondary-sm" onclick="exportNote()">
-                            <i class="bi bi-download"></i> Export
-                        </button>
-                        <button class="btn-sm btn-danger-sm" onclick="deleteCurrentNote()">
-                            <i class="bi bi-trash"></i> Delete
-                        </button>
-                    </div>
+        <!-- Upload Section -->
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="bi bi-cloud-upload"></i> Upload Files</h5>
+            </div>
+            <div class="card-body">
+                <div class="upload-area" id="uploadArea" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+                    <div class="upload-icon"><i class="bi bi-file-earmark-arrow-up"></i></div>
+                    <p class="mb-2"><strong>Drag & drop files here</strong></p>
+                    <p class="text-muted mb-0">or click to browse your computer</p>
+                    <input type="file" id="fileInput" multiple onchange="handleFileSelect(event)">
                 </div>
-
-                <!-- Tab Bar -->
-                <div class="tab-bar">
-                    <button class="tab active" onclick="switchView('split')">
-                        <i class="bi bi-layout-split"></i> Split View
-                    </button>
-                    <button class="tab" onclick="switchView('edit')">
-                        <i class="bi bi-pencil"></i> Edit
-                    </button>
-                    <button class="tab" onclick="switchView('preview')">
-                        <i class="bi bi-eye"></i> Preview
+                <div class="mt-4">
+                    <button class="btn btn-primary w-100" onclick="uploadFiles()">
+                        <i class="bi bi-upload"></i> Upload Selected Files
                     </button>
                 </div>
-
-                <!-- Editor Content Area -->
-                <div class="editor-content">
-                    <!-- Editor Pane -->
-                    <div class="editor-pane" id="editorPane">
-                        <textarea class="markdown-editor" id="markdownEditor" placeholder="Write your note in Markdown..."></textarea>
+                <div id="uploadProgress" class="upload-progress-container hidden">
+                    <div class="progress" style="height: 10px;">
+                        <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%"></div>
                     </div>
-
-                    <!-- Preview Pane -->
-                    <div class="preview-pane" id="previewPane">
-                        <div class="markdown-preview" id="markdownPreview"></div>
-                    </div>
+                    <p class="text-muted small mt-3" id="uploadStatus">Uploading...</p>
                 </div>
+            </div>
+        </div>
 
-                <!-- Stats Bar -->
-                <div class="stats-bar">
-                    <div class="stat-item">
-                        <i class="bi bi-type"></i>
-                        <span id="charCount">0</span> characters
-                    </div>
-                    <div class="stat-item">
-                        <i class="bi bi-card-text"></i>
-                        <span id="wordCount">0</span> words
-                    </div>
-                    <div class="stat-item">
-                        <i class="bi bi-clock"></i>
-                        Last saved: <span id="lastSaved">never</span>
+        <!-- Search & Filter Section -->
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="bi bi-funnel"></i> Search & Filter</h5>
+            </div>
+            <div class="card-body">
+                <div class="search-filter-container">
+                    <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search files by name..." onkeyup="filterFiles()">
+                    <button class="filter-btn active" onclick="filterByType('all')">All Files</button>
+                    <button class="filter-btn" onclick="filterByType('image')"><i class="bi bi-image"></i> Images</button>
+                    <button class="filter-btn" onclick="filterByType('document')"><i class="bi bi-file-text"></i> Documents</button>
+                    <button class="filter-btn" onclick="filterByType('video')"><i class="bi bi-film"></i> Videos</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Files Section -->
+        <div class="card">
+            <div class="card-header">
+                <div class="d-flex justify-content-between align-items-center">
+                    <h5 style="margin: 0;"><i class="bi bi-folder-open"></i> Your Files</h5>
+                    <button class="btn btn-light btn-sm" onclick="refreshFiles()" title="Refresh list">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div id="filesContainer">
+                    <div class="empty-state">
+                        <i class="bi bi-inbox"></i>
+                        <h4>No files yet</h4>
+                        <p>Upload your first file to get started</p>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- Footer -->
+    <div class="footer text-muted">
+        <small>AzureVault Pro v2.0 | Advanced Secure Cloud File Manager | Powered by Azure</small>
+    </div>
+
     <!-- Toast Container -->
     <div class="toast-container" id="toastContainer"></div>
 
+    <!-- Preview Modal -->
+    <div class="modal fade" id="previewModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="previewTitle">File Preview</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="previewContent">
+                    Loading...
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        let currentNote = null;
-        let allNotes = [];
-        let currentView = 'split';
+        let selectedFiles = [];
+        let allFiles = [];
+        let currentFilter = 'all';
+        const previewModal = new bootstrap.Modal(document.getElementById('previewModal'));
 
-        // Initialize
-        loadNotes();
-        
-        document.getElementById('markdownEditor').addEventListener('input', () => {
-            updatePreview();
-            updateStats();
-        });
+        function getFileType(filename) {
+            const ext = filename.split('.').pop().toLowerCase();
+            const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp'];
+            const docExts = ['pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx', 'ppt', 'pptx'];
+            const videoExts = ['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv'];
 
-        function createNewNote() {
-            const title = prompt('Note Title:', 'Untitled Note');
-            if (!title) return;
+            if (imageExts.includes(ext)) return 'image';
+            if (docExts.includes(ext)) return 'document';
+            if (videoExts.includes(ext)) return 'video';
+            return 'other';
+        }
 
-            const note = {
-                id: Date.now().toString(),
-                title: title,
-                content: '# ' + title + '\\n\\nStart typing...',
-                tags: [],
-                created: new Date().toISOString()
+        function getFileIcon(filename) {
+            const type = getFileType(filename);
+            const icons = {
+                'image': 'bi-file-image',
+                'document': 'bi-file-text',
+                'video': 'bi-file-play',
+                'other': 'bi-file-earmark'
             };
-
-            currentNote = note;
-            allNotes.unshift(note);
-            displayEditor();
-            showNotes();
-            showToast('Note created', 'success');
+            return icons[type] || 'bi-file-earmark';
         }
 
-        function loadNotes() {
-            fetch('/notes')
-                .then(r => r.json())
-                .then(notes => {
-                    allNotes = notes;
-                    showNotes();
-                    showTags();
-                })
-                .catch(e => showToast('Error loading notes', 'danger'));
+        function handleDragOver(e) {
+            e.preventDefault();
+            document.getElementById('uploadArea').classList.add('dragover');
         }
 
-        function showNotes() {
-            const container = document.getElementById('notesList');
-            if (allNotes.length === 0) {
-                container.innerHTML = '<p style="color: #999; font-size: 0.9rem;">No notes yet</p>';
+        function handleDragLeave(e) {
+            e.preventDefault();
+            document.getElementById('uploadArea').classList.remove('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            document.getElementById('uploadArea').classList.remove('dragover');
+            selectedFiles = Array.from(e.dataTransfer.files);
+            updateFileDisplay();
+        }
+
+        function handleFileSelect(e) {
+            selectedFiles = Array.from(e.target.files);
+            updateFileDisplay();
+        }
+
+        function updateFileDisplay() {
+            const area = document.getElementById('uploadArea');
+            if (selectedFiles.length === 0) {
+                area.innerHTML = `
+                    <div class="upload-icon"><i class="bi bi-file-earmark-arrow-up"></i></div>
+                    <p class="mb-2"><strong>Drag & drop files here</strong></p>
+                    <p class="text-muted mb-0">or click to browse</p>
+                `;
+            } else {
+                const totalSize = (selectedFiles.reduce((sum, f) => sum + f.size, 0) / 1024 / 1024).toFixed(2);
+                area.innerHTML = `
+                    <div class="upload-icon upload-icon-success"><i class="bi bi-check-circle"></i></div>
+                    <p class="mb-1"><strong>${selectedFiles.length} file(s) selected</strong></p>
+                    <p class="text-muted mb-0">${totalSize} MB</p>
+                `;
+            }
+        }
+
+        function uploadFiles() {
+            if (selectedFiles.length === 0) {
+                showToast('Please select files to upload', 'warning');
                 return;
             }
 
-            container.innerHTML = allNotes.map(note => `
-                <div class="note-item ${currentNote && currentNote.id === note.id ? 'active' : ''}" onclick="selectNote('${note.id}')">
-                    <div class="note-item-title">${note.title}</div>
-                    <div class="note-item-date">${new Date(note.created).toLocaleDateString()}</div>
-                </div>
-            `).join('');
-        }
+            document.getElementById('uploadProgress').classList.remove('hidden');
+            let uploaded = 0;
 
-        function showTags() {
-            const allTags = [...new Set(allNotes.flatMap(n => n.tags || []))];
-            const container = document.getElementById('tagsContainer');
-            
-            if (allTags.length === 0) {
-                container.innerHTML = '<p style="color: #999; font-size: 0.9rem;">No tags</p>';
-                return;
-            }
+            selectedFiles.forEach((file) => {
+                const formData = new FormData();
+                formData.append('file', file);
 
-            container.innerHTML = allTags.map(tag => `
-                <span class="tag" onclick="filterByTag('${tag}')">#${tag}</span>
-            `).join('');
-        }
+                fetch('/upload', { method: 'POST', body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        uploaded++;
+                        const progress = (uploaded / selectedFiles.length) * 100;
+                        document.getElementById('progressBar').style.width = progress + '%';
+                        document.getElementById('uploadStatus').textContent = `Uploading ${uploaded}/${selectedFiles.length}...`;
 
-        function selectNote(id) {
-            const note = allNotes.find(n => n.id === id);
-            if (!note) return;
-
-            if (currentNote && currentNote.content !== document.getElementById('markdownEditor').value) {
-                if (!confirm('Save changes to current note?')) return;
-                saveNote();
-            }
-
-            currentNote = note;
-            document.getElementById('noteTitle').value = note.title;
-            document.getElementById('markdownEditor').value = note.content;
-            updatePreview();
-            updateStats();
-            displayEditor();
-            showNotes();
-        }
-
-        function displayEditor() {
-            document.getElementById('emptyState').style.display = 'none';
-            document.getElementById('editorContent').style.display = 'flex';
-        }
-
-        function saveNote() {
-            if (!currentNote) return;
-
-            currentNote.title = document.getElementById('noteTitle').value;
-            currentNote.content = document.getElementById('markdownEditor').value;
-            currentNote.tags = extractTags(currentNote.content);
-
-            fetch('/save-note', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentNote)
-            })
-            .then(r => r.json())
-            .then(d => {
-                showToast('Note saved', 'success');
-                document.getElementById('lastSaved').textContent = new Date().toLocaleTimeString();
-                showTags();
-            })
-            .catch(e => showToast('Error saving note', 'danger'));
-        }
-
-        function deleteCurrentNote() {
-            if (!currentNote || !confirm('Delete this note?')) return;
-
-            fetch(`/delete-note?id=${currentNote.id}`, { method: 'DELETE' })
-                .then(r => r.json())
-                .then(d => {
-                    allNotes = allNotes.filter(n => n.id !== currentNote.id);
-                    currentNote = null;
-                    document.getElementById('emptyState').style.display = 'flex';
-                    document.getElementById('editorContent').style.display = 'none';
-                    showNotes();
-                    showToast('Note deleted', 'success');
-                })
-                .catch(e => showToast('Error deleting note', 'danger'));
-        }
-
-        function exportNote() {
-            if (!currentNote) return;
-
-            const element = document.createElement('a');
-            const file = new Blob([currentNote.content], { type: 'text/markdown' });
-            element.href = URL.createObjectURL(file);
-            element.download = currentNote.title + '.md';
-            element.click();
-            showToast('Note exported', 'success');
-        }
-
-        function updatePreview() {
-            const content = document.getElementById('markdownEditor').value;
-            const html = marked.parse(content);
-            document.getElementById('markdownPreview').innerHTML = DOMPurify.sanitize(html);
-            
-            document.querySelectorAll('pre code').forEach(block => {
-                hljs.highlightElement(block);
+                        if (uploaded === selectedFiles.length) {
+                            setTimeout(() => {
+                                document.getElementById('uploadProgress').classList.add('hidden');
+                                document.getElementById('progressBar').style.width = '0%';
+                                selectedFiles = [];
+                                updateFileDisplay();
+                                showToast('All files uploaded!', 'success');
+                                refreshFiles();
+                            }, 500);
+                        }
+                    })
+                    .catch(e => showToast(`Error uploading ${file.name}`, 'danger'));
             });
         }
 
-        function updateStats() {
-            const content = document.getElementById('markdownEditor').value;
-            document.getElementById('charCount').textContent = content.length;
-            document.getElementById('wordCount').textContent = content.trim().split(/\\s+/).filter(w => w).length;
+        function refreshFiles() {
+            fetch('/files')
+                .then(r => r.json())
+                .then(files => {
+                    allFiles = files;
+                    updateStats();
+                    displayFiles(files);
+                })
+                .catch(e => showToast('Error loading files', 'danger'));
         }
 
-        function extractTags(content) {
-            const matches = content.match(/#\\w+/g) || [];
-            return matches.map(tag => tag.substring(1));
-        }
-
-        function filterNotes() {
-            const search = document.getElementById('searchInput').value.toLowerCase();
-            const filtered = allNotes.filter(n => n.title.toLowerCase().includes(search));
-            
-            const container = document.getElementById('notesList');
-            container.innerHTML = filtered.map(note => `
-                <div class="note-item ${currentNote && currentNote.id === note.id ? 'active' : ''}" onclick="selectNote('${note.id}')">
-                    <div class="note-item-title">${note.title}</div>
-                    <div class="note-item-date">${new Date(note.created).toLocaleDateString()}</div>
-                </div>
-            `).join('');
-        }
-
-        function filterByTag(tag) {
-            // Filter notes by tag
-            const filtered = allNotes.filter(n => (n.tags || []).includes(tag));
-            const container = document.getElementById('notesList');
-            container.innerHTML = filtered.map(note => `
-                <div class="note-item" onclick="selectNote('${note.id}')">
-                    <div class="note-item-title">${note.title}</div>
-                </div>
-            `).join('');
-        }
-
-        function switchView(view) {
-            currentView = view;
-            const editor = document.getElementById('editorPane');
-            const preview = document.getElementById('previewPane');
-
-            if (view === 'split') {
-                editor.style.display = 'flex';
-                preview.style.display = 'block';
-                editor.style.borderRight = '1px solid var(--border)';
-            } else if (view === 'edit') {
-                editor.style.display = 'flex';
-                preview.style.display = 'none';
-            } else if (view === 'preview') {
-                editor.style.display = 'none';
-                preview.style.display = 'block';
+        function displayFiles(files) {
+            const container = document.getElementById('filesContainer');
+            if (files.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <i class="bi bi-inbox"></i>
+                        <h4>No files found</h4>
+                        <p>Try uploading a file or adjust your filters</p>
+                    </div>
+                `;
+            } else {
+                container.innerHTML = files.map(f => `
+                    <div class="file-item">
+                        <div class="file-info">
+                            <div class="file-name">
+                                <i class="bi ${getFileIcon(f.name)} file-icon"></i>
+                                ${f.name}
+                            </div>
+                            <div class="file-meta">
+                                <span>📦 ${(f.size / 1024 / 1024).toFixed(2)} MB</span>
+                                <span>📅 ${new Date(f.time * 1000).toLocaleDateString()}</span>
+                            </div>
+                        </div>
+                        <div class="file-actions">
+                            <button class="btn-action btn-preview" onclick="previewFile('${f.name}')">
+                                <i class="bi bi-eye"></i> Preview
+                            </button>
+                            <button class="btn-action btn-download" onclick="downloadFile('${f.name}')">
+                                <i class="bi bi-download"></i> Download
+                            </button>
+                            <button class="btn-action btn-share" onclick="copyShareLink('${f.name}')">
+                                <i class="bi bi-link-45deg"></i> Share
+                            </button>
+                            <button class="btn-action btn-delete" onclick="deleteFile('${f.name}')">
+                                <i class="bi bi-trash"></i> Delete
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
             }
+        }
+
+        function updateStats() {
+            document.getElementById('totalFiles').textContent = allFiles.length;
+            const totalSize = (allFiles.reduce((sum, f) => sum + f.size, 0) / 1024 / 1024).toFixed(2);
+            document.getElementById('totalSize').textContent = totalSize + ' MB';
+            
+            const images = allFiles.filter(f => getFileType(f.name) === 'image').length;
+            const docs = allFiles.filter(f => getFileType(f.name) === 'document').length;
+            
+            document.getElementById('imageCount').textContent = images;
+            document.getElementById('docCount').textContent = docs;
+        }
+
+        function filterFiles() {
+            const search = document.getElementById('searchInput').value.toLowerCase();
+            const filtered = allFiles.filter(f => 
+                f.name.toLowerCase().includes(search) && 
+                (currentFilter === 'all' || getFileType(f.name) === currentFilter)
+            );
+            displayFiles(filtered);
+        }
+
+        function filterByType(type) {
+            currentFilter = type;
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            filterFiles();
+        }
+
+        function previewFile(name) {
+            fetch(`/preview?name=${encodeURIComponent(name)}`)
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('previewTitle').textContent = name;
+                    document.getElementById('previewContent').innerHTML = d.preview;
+                    previewModal.show();
+                })
+                .catch(e => showToast('Cannot preview this file type', 'danger'));
+        }
+
+        function downloadFile(name) {
+            window.location.href = `/download?name=${encodeURIComponent(name)}`;
+        }
+
+        function copyShareLink(name) {
+            const link = `${window.location.origin}/share?name=${encodeURIComponent(name)}`;
+            navigator.clipboard.writeText(link);
+            showToast('Share link copied to clipboard!', 'success');
+        }
+
+        function deleteFile(name) {
+            if (!confirm(`Delete "${name}"?`)) return;
+
+            fetch(`/delete?name=${encodeURIComponent(name)}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(d => {
+                    showToast(`"${name}" deleted`, 'success');
+                    refreshFiles();
+                })
+                .catch(e => showToast('Error deleting file', 'danger'));
         }
 
         function showToast(message, type = 'info') {
             const toast = document.createElement('div');
-            toast.className = `alert alert-${type} alert-dismissible fade show`;
-            toast.innerHTML = `
-                ${message}
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            `;
+            toast.className = 'toast';
+            const icons = {
+                'success': '✓',
+                'danger': '✕',
+                'warning': '⚠',
+                'info': 'ℹ'
+            };
+            toast.innerHTML = `<strong>${icons[type]}</strong> ${message}`;
             document.getElementById('toastContainer').appendChild(toast);
             setTimeout(() => toast.remove(), 5000);
         }
+
+        // Initialize
+        refreshFiles();
+        document.getElementById('uploadArea').addEventListener('click', () => {
+            document.getElementById('fileInput').click();
+        });
     </script>
 </body>
 </html>
 '''
 
+def get_file_stats():
+    try:
+        if not STORAGE_CONNECTION_STRING:
+            return {}
+        blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container = blob_service.get_container_client(CONTAINER_NAME)
+        
+        stats = {}
+        for blob in container.list_blobs():
+            stats[blob.name] = {
+                'size': blob.size or 0,
+                'time': blob.last_modified.timestamp() if blob.last_modified else 0
+            }
+        return stats
+    except:
+        return {}
+
 @app.route('/')
 def home():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/notes', methods=['GET'])
-def get_notes():
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'service': 'av-vault-pro'})
+
+@app.route('/files', methods=['GET'])
+def list_files():
     try:
         if not STORAGE_CONNECTION_STRING:
             return jsonify([])
@@ -809,63 +880,122 @@ def get_notes():
         blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         container = blob_service.get_container_client(CONTAINER_NAME)
         
-        notes = []
+        files = []
         for blob in container.list_blobs():
-            if blob.name.endswith('.md'):
-                try:
-                    content = blob_service.get_blob_client(CONTAINER_NAME, blob.name).download_blob().readall().decode('utf-8')
-                    title = blob.name.replace('.md', '')
-                    notes.append({
-                        'id': blob.name,
-                        'title': title,
-                        'content': content,
-                        'tags': extractTags(content),
-                        'created': blob.last_modified.isoformat() if blob.last_modified else ''
-                    })
-                except:
-                    pass
+            files.append({
+                'name': blob.name,
+                'size': blob.size or 0,
+                'time': blob.last_modified.timestamp() if blob.last_modified else 0
+            })
         
-        return jsonify(sorted(notes, key=lambda x: x['created'], reverse=True))
+        return jsonify(sorted(files, key=lambda x: x['time'], reverse=True))
     except Exception as e:
         return jsonify([]), 500
 
-def extractTags(content):
-    matches = re.findall(r'#\w+', content)
-    return [tag[1:] for tag in matches]
-
-@app.route('/save-note', methods=['POST'])
-def save_note():
+@app.route('/upload', methods=['POST'])
+def upload_file():
     try:
         if not STORAGE_CONNECTION_STRING:
             return jsonify({'error': 'Storage not configured'}), 400
         
-        data = request.json
-        note_title = data.get('title', 'Untitled')
-        note_content = data.get('content', '')
+        file = request.files['file']
+        if not file:
+            return jsonify({'error': 'No file provided'}), 400
         
         blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         container = blob_service.get_container_client(CONTAINER_NAME)
+        container.upload_blob(file.filename, file.read(), overwrite=True)
         
-        blob_name = f"{note_title}.md"
-        container.upload_blob(blob_name, note_content.encode('utf-8'), overwrite=True)
-        
-        return jsonify({'message': 'Note saved'})
+        return jsonify({'message': f'✓ {file.filename} uploaded'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/delete-note', methods=['DELETE'])
-def delete_note():
+@app.route('/download', methods=['GET'])
+def download_file():
     try:
         if not STORAGE_CONNECTION_STRING:
             return jsonify({'error': 'Storage not configured'}), 400
         
-        note_id = request.args.get('id')
+        name = request.args.get('name')
+        blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container = blob_service.get_container_client(CONTAINER_NAME)
+        blob_client = container.get_blob_client(name)
+        
+        download_stream = blob_client.download_blob()
+        return send_file(
+            BytesIO(download_stream.readall()),
+            as_attachment=True,
+            download_name=name
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/delete', methods=['DELETE'])
+def delete_file():
+    try:
+        if not STORAGE_CONNECTION_STRING:
+            return jsonify({'error': 'Storage not configured'}), 400
+        
+        name = request.args.get('name')
+        blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container = blob_service.get_container_client(CONTAINER_NAME)
+        container.delete_blob(name)
+        
+        return jsonify({'message': f'✓ {name} deleted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/preview', methods=['GET'])
+def preview_file():
+    try:
+        if not STORAGE_CONNECTION_STRING:
+            return jsonify({'error': 'Storage not configured'}), 400
+        
+        name = request.args.get('name')
+        ext = name.split('.')[-1].lower()
         
         blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         container = blob_service.get_container_client(CONTAINER_NAME)
-        container.delete_blob(note_id)
+        blob_client = container.get_blob_client(name)
+        download_stream = blob_client.download_blob()
+        content = download_stream.readall()
         
-        return jsonify({'message': 'Note deleted'})
+        if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']:
+            import base64
+            b64 = base64.b64encode(content).decode('utf-8')
+            preview_html = f'<img src="data:image/{ext};base64,{b64}" style="max-width: 100%; border-radius: 8px;">'
+        elif ext == 'txt':
+            preview_html = f'<pre style="background: #f5f5f5; padding: 20px; border-radius: 8px; overflow-x: auto;">{content.decode("utf-8", errors="ignore")}</pre>'
+        elif ext == 'pdf':
+            import base64
+            b64 = base64.b64encode(content).decode('utf-8')
+            preview_html = f'<embed src="data:application/pdf;base64,{b64}" width="100%" height="600px" type="application/pdf">'
+        else:
+            preview_html = f'<p style="color: #999; text-align: center; padding: 40px;">Preview not available for this file type</p>'
+        
+        return jsonify({'preview': preview_html})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+Upload Progress 
+@app.route('/share', methods=['GET'])
+def share_file():
+    try:
+        if not STORAGE_CONNECTION_STRING or not ACCOUNT_KEY:
+            return jsonify({'error': 'Storage not configured'}), 400
+        
+        name = request.args.get('name')
+        
+        sas_token = generate_blob_sas(
+            account_name=STORAGE_ACCOUNT_NAME,
+            container_name=CONTAINER_NAME,
+            blob_name=name,
+            account_key=ACCOUNT_KEY,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(days=7)
+        )
+        
+        share_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{CONTAINER_NAME}/{name}?{sas_token}"
+        return jsonify({'share_url': share_url})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
